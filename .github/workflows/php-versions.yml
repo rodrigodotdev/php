@@ -1,0 +1,57 @@
+name: Fetch PHP Versions
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  extract-php-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.filter-versions.outputs.versions }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch and filter PHP versions
+        id: filter-versions
+        run: |
+          set -euo pipefail
+
+          # Get timestamp for 2 days ago
+          two_days_ago=$(date -d "-2 days" +%s)
+          echo "Filtering PHP versions modified after: $(date -d "-2 days")"
+
+          # Fetch and filter PHP CLI versions from the last 2 days
+          versions=$(curl -sS "https://dl.static-php.dev/static-php-cli/bulk/?format=json" \
+            | jq -c --argjson cutoff "$two_days_ago" '
+                [.[] 
+                | select(.name | test("-cli-")) 
+                | select((.last_modified | strptime("%Y-%m-%d %H:%M:%S") | mktime) > $cutoff)
+                | .name
+                | capture("php-(?<ver>[0-9]+\\.[0-9]+\\.[0-9]+)-cli-").ver
+                ]
+                | unique
+                | sort_by(.)
+              ')
+
+          echo "Found versions: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  dispatch-releases:
+    needs: extract-php-versions
+    runs-on: ubuntu-latest
+    if: needs.extract-php-versions.outputs.versions != '[]'
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.extract-php-versions.outputs.versions) }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Dispatch release workflow for PHP ${{ matrix.version }}
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: php-release.yml
+          inputs: '{ "version": "${{ matrix.version }}" }'
