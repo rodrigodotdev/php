@@ -1,0 +1,177 @@
+name: Create PHP Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'PHP version to release (e.g., 8.4.12)'
+        required: true
+        type: string
+
+jobs:
+  create-php-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PHP_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate PHP version format
+        run: |
+          if ! echo "$PHP_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: Invalid PHP version format. Expected format: X.Y.Z"
+            exit 1
+          fi
+          echo "PHP version format is valid: $PHP_VERSION"
+
+      - name: Fetch PHP CLI tarballs for version ${{ env.PHP_VERSION }}
+        run: |
+          echo "Fetching tarballs for PHP version: $PHP_VERSION"
+
+          # Create directory for downloads and initialize file list
+          mkdir -p downloads
+          > matching_filepaths.txt
+
+          # Fetch Linux/macOS tarballs
+          echo "Fetching Linux/macOS tarballs..."
+          curl -sS "https://dl.static-php.dev/static-php-cli/bulk/?format=json" \
+            | jq -r --arg version "$PHP_VERSION" '
+                .[]
+                | select(.name | test("php-\($version)-cli-.*\\.tar\\.gz$"))
+                | .full_path
+              ' >> matching_filepaths.txt
+
+          # Fetch Windows tarballs
+          echo "Fetching Windows tarballs..."
+          curl -sS "https://dl.static-php.dev/static-php-cli/windows/spc-max/?format=json" \
+            | jq -r --arg version "$PHP_VERSION" '
+                .[]
+                | select(.name | test("php-\($version)-cli-.*\\.zip$"))
+                | .full_path
+              ' >> matching_filepaths.txt
+
+          # Verify that files were found
+          if [ ! -s matching_filepaths.txt ]; then
+            echo "Error: No matching file paths found for PHP version $PHP_VERSION"
+            exit 1
+          fi
+
+          echo "Found matching file paths:"
+          cat matching_filepaths.txt
+
+          # Download and rename files
+          while IFS= read -r filepath; do
+            filename=$(basename "$filepath")
+            echo "Downloading: $filename"
+            
+            if ! curl -L -o "downloads/$filename" "https://dl.static-php.dev/$filepath"; then
+              echo "Error: Failed to download $filename"
+              exit 1
+            fi
+
+            # Extract architecture and file extension
+            if [[ "$filename" =~ php-${PHP_VERSION}-cli-(.+)\.tar\.gz$ ]]; then
+              arch="${BASH_REMATCH[1]}"
+              fileext="tar.gz"
+            elif [[ "$filename" =~ php-${PHP_VERSION}-cli-(.+)\.zip$ ]]; then
+              arch="${BASH_REMATCH[1]}"
+              fileext="zip"
+            else
+              echo "Error: Could not extract arch/file extension from $filename"
+              exit 1
+            fi
+
+            # Rename file to standardized format
+            new_filename="php-${PHP_VERSION}-${arch}.${fileext}"
+            mv "downloads/$filename" "downloads/$new_filename"
+            echo "Renamed to: $new_filename"
+          done < matching_filepaths.txt
+
+          echo "Final files in downloads directory:"
+          ls -la downloads/
+
+      - name: Generate checksums (SHA256)
+        run: |
+          cd downloads
+          echo "Generating SHASUMS256.txt"
+          
+          # Generate checksums in consistent order
+          for file in $(ls -1 | sort); do
+            if [ -f "$file" ]; then
+              sha256sum "$file" >> SHASUMS256.txt
+            fi
+          done
+          
+          echo "Generated checksums:"
+          cat SHASUMS256.txt
+
+      - name: Generate manifest.json
+        run: |
+          cd downloads
+          echo "Generating manifest.json"
+          
+          # Build JSON array with proper formatting
+          echo '[' > manifest.json
+          first=1
+          
+          # Process files in deterministic order
+          for file in $(ls -1 | grep -v -E 'manifest.json|SHASUMS256.txt' | sort); do
+            # Extract architecture from filename
+            arch_part="$file"
+            arch_part=${arch_part#php-${PHP_VERSION}-}
+            arch_part=${arch_part%.tar.gz}
+            arch_part=${arch_part%.zip}
+            
+            # Get checksum and file size
+            sha=$(grep "  $file$" SHASUMS256.txt | awk '{print $1}')
+            size=$(stat -c %s "$file")
+            
+            # Add comma separator for all items except the first
+            [ $first -eq 0 ] && echo ',' >> manifest.json || first=0
+            
+            # Generate JSON entry for the file
+            jq -n --arg filename "$file" \
+                  --arg version "$PHP_VERSION" \
+                  --arg arch "$arch_part" \
+                  --arg sha256 "$sha" \
+                  --argjson size "$size" \
+                  '{filename:$filename,version:$version,arch:$arch,sha256:$sha256,size:$size}' >> manifest.json
+          done
+          
+          echo ']' >> manifest.json
+          
+          # Format JSON for readability
+          cat manifest.json | jq '.' > manifest.pretty.json && mv manifest.pretty.json manifest.json
+          
+          echo "Generated manifest.json:"
+          cat manifest.json
+
+      - name: Extract major version
+        run: |
+          VERSION_MAJOR=$(echo "$PHP_VERSION" | cut -d'.' -f1)
+          echo "VERSION_MAJOR=$VERSION_MAJOR" >> $GITHUB_ENV
+          echo "Extracted major version: $VERSION_MAJOR"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.PHP_VERSION }}"
+          draft: false
+          files: |
+            downloads/**
+          body: |
+            # PHP v${{ env.PHP_VERSION }}
+
+            Changelog: [What's changed in v${{ env.PHP_VERSION }}?](https://www.php.net/ChangeLog-${{ env.VERSION_MAJOR }}.php#${{ env.PHP_VERSION }})
+
+            Sources:
+              * https://dl.static-php.dev/static-php-cli/bulk/
+              * https://dl.static-php.dev/static-php-cli/windows/spc-max/
+            
+            Assets include:
+              * Renamed upstream static binaries
+              * SHASUMS256.txt (SHA256 integrity list)
+              * manifest.json (machine-readable asset metadata)
